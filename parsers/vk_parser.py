@@ -47,12 +47,13 @@ def chunk_list(data, chunk_size):
 async def process_vk_batch(session: aiohttp.ClientSession, groups_chunk, rmq_channel: aio_pika.Channel):
     """Формирует VKScript, делает один запрос к API и рассылает лиды в очередь."""
     
-    # 1. Формируем код для метода execute
+    # 1. Формируем код для метода execute (Исправлено для VKScript)
     vk_script = "var res = {};\n"
     for group in groups_chunk:
         owner_id = group["group_id"]
-        # Запрашиваем 5 последних постов со стены
-        vk_script += f'res["{owner_id}"] = API.wall.get({{"owner_id": {owner_id}, "count": 5}});\n'
+        # Создаем безопасный ключ без минусов, например group_12345
+        safe_key = f"group_{str(owner_id).replace('-', '')}"
+        vk_script += f'res.{safe_key} = API.wall.get({{"owner_id": {owner_id}, "count": 5}});\n'
     vk_script += "return res;"
 
     payload = {
@@ -77,7 +78,10 @@ async def process_vk_batch(session: aiohttp.ClientSession, groups_chunk, rmq_cha
                 db_id = group["id"]
                 last_checked_id = group.get("last_checked_post_id", 0)
                 
-                group_data = results.get(str(owner_id), {})
+                # Читаем данные по нашему безопасному ключу
+                safe_key = f"group_{str(owner_id).replace('-', '')}"
+                group_data = results.get(safe_key, {})
+                
                 if not group_data or not isinstance(group_data, dict):
                     continue
                     
