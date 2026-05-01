@@ -1,170 +1,199 @@
-from __future__ import annotations
-
-import asyncio
+import os
+import sys
 import json
-import logging
-
+import asyncio
+import re
 import aiohttp
-from openai import OpenAI
+import aio_pika
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
-from config import (
-	AMQP_QUEUE_LEADS,
-	AMQP_URL,
-	NOTIFIER_WEBHOOK_URL,
-	OPENROUTER_API_KEY,
-	OPENROUTER_MODEL,
-	SUPABASE_KEY,
-	SUPABASE_URL,
+# Настраиваем пути
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(BASE_DIR)
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+
+# Забираем доступы
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+AMQP_URL = os.getenv("AMQP_URL")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+NOTIFIER_WEBHOOK_URL = os.getenv("NOTIFIER_WEBHOOK_URL")
+
+# Инициализируем БД
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+LEADS_QUEUE = "raw_telegram_leads"
+
+# ---------------------------------------------------------
+# 1. МОЩНЫЙ REGEX ФИЛЬТР (Предквалификация)
+# ---------------------------------------------------------
+# \b означает границу слова, \w* захватывает любые окончания
+KEYWORDS_PATTERN = re.compile(
+    r"\b("
+    # Базовые боты и ИИ
+    r"чат-?бот\w*|бот\w*|bot\w*|ии\s*бот\w*|ai\s*бот\w*|"
+    r"ии\w*|ai\w*|нейросеть\w*|chatgpt|gpt|llm|openai|claude|"
+    # Автоматизация и бизнес-процессы
+    r"автоматизац\w*|внедрен\w*|интеграц\w*|"
+    r"n8n|langgraph|openclaw|nemoclaw|"
+    # Маркетплейсы и парсинг
+    r"маркетплейс\w*|wildberries|вайлдберриз|wb|ozon|озон|"
+    r"аналитик\w*|воронка\s*продаж|парсер\w*|парсинг\w*|"
+    # Агенты и аватары
+    r"агент\w*|ai\s*агент\w*|ии\s*агент\w*|"
+    r"3[dд]-?\s*аватар\w*|"
+    # Платформы
+    r"вк|vk|vkontakte|телеграм\w*|telegram|тг|"
+    # Намерения (глаголы)
+    r"сделать|запрограммировать|разработа\w*|созда\w*|ищу\s*программиста|нужен\s*разработчик"
+    r")\b",
+    re.IGNORECASE
 )
-from core.database import save_lead
-from core.rabbitmq import RabbitMQClient
 
+def is_relevant_text(text: str) -> bool:
+    """Молниеносная проверка регуляркой (True, если есть совпадения)"""
+    return bool(KEYWORDS_PATTERN.search(text))
 
-logging.basicConfig(
-	level=logging.INFO,
-	format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("ai_worker")
+# ---------------------------------------------------------
+# 2. ПРОМПТ ДЛЯ LLM (Основная квалификация)
+# ---------------------------------------------------------
+SYSTEM_PROMPT = """Ты — опытный квалификатор лидов для IT-агентства.
+Твоя задача: проанализировать перехваченное сообщение из чата и понять, ищет ли автор исполнителя на коммерческую разработку.
 
+НАШИ ЦЕЛЕВЫЕ ЛИДЫ ИЩУТ:
+- Создание Telegram или VK ботов (в т.ч. для ресторанов, доставки, техподдержки).
+- Внедрение ИИ, LLM, нейросетей, 3D-аватаров.
+- Разработку AI-агентов (в т.ч. многоагентных систем) и автоматизацию бизнес-процессов (n8n, LangGraph).
+- Автоматизацию работы с маркетплейсами (парсеры, логистика, сбор данных для сложных воронок на Wildberries/Ozon).
 
-PROMPT_TEMPLATE = """
-Ты анализируешь сообщения из Telegram-чатов и определяешь, является ли сообщение реальным коммерческим запросом на услуги разработки.
+ОТБРАКОВЫВАЙ:
+- Программистов, которые просят помощи с кодом (ошибки, дебаг).
+- Людей, которые обсуждают новости ИИ или просто общаются.
+- Тех, кто предлагает СВОИ услуги разработки (конкурентов).
+- Спам и рекламу каналов.
 
-Считай LEAD=true только если есть явный запрос на заказ/разработку/поиск исполнителя для:
-- AI-бота
-- Telegram-бота
-- автоматизации на n8n
-- похожих AI/automation решений
+Отвечай СТРОГО в формате JSON:
+{"is_lead": true/false, "reason": "Кратко, почему это наш клиент или почему мусор"}"""
 
-Ответь только JSON-объектом без markdown:
-{
-  "is_lead": true/false,
-  "confidence": 0..1,
-  "reason": "кратко"
-}
+async def check_duplicate_in_db(message_id: int, chat_id: int) -> bool:
+    """Проверяет, было ли уже это сообщение в БД."""
+    try:
+        response = supabase.table("parsed_leads").select("id").eq("message_id", message_id).eq("chat_id", chat_id).execute()
+        return len(response.data) > 0
+    except Exception as e:
+        print(f"⚠️ Ошибка проверки БД: {e}")
+        return False
 
-Сообщение:
-{text}
-""".strip()
+async def save_to_db(lead_data: dict, status: str):
+    """Сохраняет сообщение в БД со статусом."""
+    try:
+        supabase.table("parsed_leads").insert({
+            "message_id": lead_data["message_id"],
+            "chat_id": lead_data["chat_id"],
+            "chat_username": lead_data.get("chat_username", ""),
+            "text": lead_data["text"],
+            "status": status
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ Ошибка записи в БД: {e}")
 
+async def analyze_text_with_llm(session: aiohttp.ClientSession, text: str) -> dict:
+    """Отправляет текст в OpenRouter и возвращает JSON-ответ."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "google/gemini-2.5-flash", # Отличная модель для JSON-задач
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text}
+        ],
+        "response_format": {"type": "json_object"}
+    }
 
-def classify_message(client: OpenAI, text: str) -> dict:
-	prompt = PROMPT_TEMPLATE.format(text=text.strip())
-	response = client.chat.completions.create(
-		model=OPENROUTER_MODEL,
-		messages=[
-			{"role": "system", "content": "Ты строгий классификатор лидов."},
-			{"role": "user", "content": prompt},
-		],
-		temperature=0,
-	)
-	content = (response.choices[0].message.content or "{}").strip()
+    try:
+        async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                content = result['choices'][0]['message']['content']
+                clean_content = content.replace('```json', '').replace('```', '').strip()
+                return json.loads(clean_content)
+            else:
+                print(f"⚠️ Ошибка OpenRouter: {resp.status} - {await resp.text()}")
+                return {"is_lead": False, "reason": "API Error"}
+    except Exception as e:
+        print(f"⚠️ Ошибка парсинга ответа LLM: {e}")
+        return {"is_lead": False, "reason": "Parsing Error"}
 
-	try:
-		data = json.loads(content)
-	except json.JSONDecodeError:
-		return {"is_lead": False, "confidence": 0.0, "reason": "invalid_json"}
+async def notify_cf_worker(session: aiohttp.ClientSession, lead_data: dict, analysis: dict):
+    """Отправляет отфильтрованный лид на Cloudflare Worker."""
+    payload = {
+        "chat_username": lead_data.get("chat_username"),
+        "text": lead_data["text"],
+        "reason": analysis.get("reason"),
+        "chat_id": lead_data["chat_id"],        # ДОБАВИЛИ ЭТО
+        "message_id": lead_data["message_id"]   # И ЭТО
+    }
+    try:
+        async with session.post(NOTIFIER_WEBHOOK_URL, json=payload) as resp:
+            if resp.status == 200:
+                print("✅ Успешно отправлено на Cloudflare Worker!")
+            else:
+                print(f"⚠️ Ошибка вебхука CF: {resp.status}")
+    except Exception as e:
+        print(f"⚠️ Ошибка вызова CF Worker: {e}")
 
-	return {
-		"is_lead": bool(data.get("is_lead", False)),
-		"confidence": float(data.get("confidence", 0.0)),
-		"reason": str(data.get("reason", ""))[:500],
-	}
+async def process_message(message: aio_pika.IncomingMessage, session: aiohttp.ClientSession):
+    """Главная функция обработки одного сообщения из очереди."""
+    async with message.process(): 
+        lead_data = json.loads(message.body.decode('utf-8'))
+        text = lead_data["text"]
 
+        # 0. ЖЕСТКАЯ ПРЕДКВАЛИФИКАЦИЯ
+        if not is_relevant_text(text):
+            # Сообщение не содержит ключей. Дропаем.
+            # print("🗑️ Пропуск: нет ключевых слов") # Раскомментируй для дебага
+            return
 
-async def send_notification(payload: dict) -> bool:
-	if not NOTIFIER_WEBHOOK_URL:
-		logger.warning("NOTIFIER_WEBHOOK_URL is empty; skipping notification")
-		return True
+        msg_id, chat_id = lead_data["message_id"], lead_data["chat_id"]
+        print(f"🎯 Прошел регулярку: {msg_id} из {lead_data.get('chat_username')}")
 
-	timeout = aiohttp.ClientTimeout(total=15)
-	async with aiohttp.ClientSession(timeout=timeout) as session:
-		async with session.post(NOTIFIER_WEBHOOK_URL, json=payload) as response:
-			if response.status < 300:
-				return True
+        # 1. Проверка на дубликат в БД
+        is_duplicate = await check_duplicate_in_db(msg_id, chat_id)
+        if is_duplicate:
+            print("⏭️ Пропуск: сообщение уже есть в базе.")
+            return
 
-			body = await response.text()
-			logger.error("Webhook failed: status=%s body=%s", response.status, body)
-			return False
+        # 2. Анализ через LLM
+        print("🧠 Отправляем в LLM...")
+        analysis = await analyze_text_with_llm(session, text)
+        
+        # 3. Маршрутизация
+        if analysis.get("is_lead"):
+            print(f"🔥 ЛИД! Причина: {analysis.get('reason')}")
+            await save_to_db(lead_data, "ai_approved")
+            await notify_cf_worker(session, lead_data, analysis)
+        else:
+            print(f"❌ Забраковано LLM. Причина: {analysis.get('reason')}")
+            await save_to_db(lead_data, "ai_rejected")
 
-
-def main() -> None:
-	if not AMQP_URL:
-		raise SystemExit("AMQP_URL is missing")
-	if not OPENROUTER_API_KEY:
-		raise SystemExit("OPENROUTER_API_KEY is missing")
-
-	rabbit = RabbitMQClient(AMQP_URL)
-	rabbit.connect()
-	llm = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-
-	logger.info("AI worker started, queue=%s model=%s", AMQP_QUEUE_LEADS, OPENROUTER_MODEL)
-
-	def process(payload: dict) -> bool:
-		text = (payload.get("message_text") or "").strip()
-		if not text:
-			return True
-
-		try:
-			verdict = classify_message(llm, text)
-		except Exception:
-			logger.exception("LLM classify error")
-			return False
-
-		if not verdict.get("is_lead"):
-			logger.info("Not a lead | msg_id=%s", payload.get("message_id"))
-			return True
-
-		notify_payload = {
-			"type": "lead_detected",
-			"source": payload.get("source"),
-			"chat_title": payload.get("chat_title"),
-			"message_text": payload.get("message_text"),
-			"message_link": payload.get("message_link"),
-			"confidence": verdict.get("confidence"),
-			"reason": verdict.get("reason"),
-		}
-
-		if SUPABASE_URL and SUPABASE_KEY:
-			try:
-				save_lead(
-					{
-						"source": payload.get("source"),
-						"chat_id": payload.get("chat_id"),
-						"chat_title": payload.get("chat_title"),
-						"message_id": payload.get("message_id"),
-						"message_text": payload.get("message_text"),
-						"message_link": payload.get("message_link"),
-						"author_id": payload.get("author_id"),
-						"author_username": payload.get("author_username"),
-						"confidence": verdict.get("confidence"),
-						"reason": verdict.get("reason"),
-					}
-				)
-			except Exception:
-				logger.exception("Supabase save failed")
-
-		try:
-			sent = asyncio.run(send_notification(notify_payload))
-		except Exception:
-			logger.exception("Webhook send error")
-			return False
-
-		if sent:
-			logger.info(
-				"Lead notified | msg_id=%s confidence=%.2f",
-				payload.get("message_id"),
-				verdict.get("confidence", 0.0),
-			)
-			return True
-
-		return False
-
-	try:
-		rabbit.consume_json(AMQP_QUEUE_LEADS, process)
-	finally:
-		rabbit.close()
-
+async def main():
+    print("🧠 AI Worker запускается...")
+    connection = await aio_pika.connect_robust(AMQP_URL)
+    
+    async with aiohttp.ClientSession() as http_session:
+        async with connection:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=1)
+            queue = await channel.declare_queue(LEADS_QUEUE, durable=True)
+            
+            print("🎧 Слушаю очередь. Нажми Ctrl+C для выхода.")
+            
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    await process_message(message, http_session)
 
 if __name__ == "__main__":
-	main()
+    asyncio.run(main())
