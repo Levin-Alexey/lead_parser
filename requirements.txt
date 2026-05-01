@@ -1,0 +1,8 @@
+pyrogram
+# Optional accelerator for Pyrogram. On Python 3.12 may require python3-dev/build-essential.
+tgcrypto
+pika
+supabase
+python-dotenv
+openai
+aiohttp
