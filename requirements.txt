@@ -6,3 +6,5 @@ supabase
 python-dotenv
 openai
 aiohttp
+aio-pika
+pysocks
