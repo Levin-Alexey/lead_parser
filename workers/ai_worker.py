@@ -18,7 +18,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 AMQP_URL = os.getenv("AMQP_URL")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-NOTIFIER_WEBHOOK_URL = os.getenv("NOTIFIER_WEBHOOK_URL")
+NOTIFIER_WEBHOOK_URL = os.getenv("NOTIFIER_WEBHOOK_URL_TG")
 
 # Инициализируем БД
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
